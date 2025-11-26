@@ -1,4 +1,5 @@
 import math
+import copy
 
 import gradio
 import os
@@ -280,142 +281,67 @@ def get_mask_from_img_sam1(mobilesamv2, yolov8, sam1_image, yolov8_image, origin
 
     return ret_mask
 
+# [demo.py 내부에 추가할 함수]
+
+@torch.no_grad
+def get_mask_from_yolo_seg(seg_model, image_np, conf=0.25):
+    """
+    yoloe-11l-seg.pt 모델을 사용하여 탐지와 마스크 생성을 한 번에 수행합니다.
+    """
+    # retina_masks=True: 마스크를 원본 이미지 해상도로 출력 (품질 향상)
+    results = seg_model.predict(image_np, conf=conf, retina_masks=True, verbose=False)
+    
+    sam_mask = []
+    
+    # 마스크가 감지되었는지 확인
+    if results[0].masks is not None:
+        # data 속성: (N, H, W) 형태의 마스크 텐서
+        masks_data = results[0].masks.data
+        img_area = image_np.shape[0] * image_np.shape[1]
+
+        for mask in masks_data:
+            # 이진화 (Binary Mask)
+            bin_mask = mask > 0.5
+            
+            # 너무 작은 객체(전체 화면의 0.2% 미만)는 노이즈로 간주하고 제외
+            if bin_mask.sum() / img_area > 0.002:
+                sam_mask.append(bin_mask)
+
+    if len(sam_mask) == 0:
+        return []
+
+    # 리스트를 텐서로 변환
+    sam_mask = torch.stack(sam_mask)
+    
+    # NMS 적용 (마스크 겹침 제거)
+    sorted_sam_mask = sorted(sam_mask, key=(lambda x: x.sum()), reverse=True)
+    keep = mask_nms(sorted_sam_mask)
+    ret_mask = filter(sorted_sam_mask, keep)
+
+    return ret_mask
+
+
 @torch.no_grad
 def get_cog_feats(images, pe3r):
+    # SigLIP을 안 쓰므로 복잡한 SAM+Feature 추출 과정이 필요 없음
+    # 하지만 파이프라인 호환성을 위해 빈 리스트와 0으로 채워진 텐서 반환
+    
+    np_images = images.np_images
     cog_seg_maps = []
     rev_cog_seg_maps = []
-    inference_state = pe3r.sam2.init_state(images=images.sam2_images, video_height=images.sam2_video_size[0], video_width=images.sam2_video_size[1])
-    mask_num = 0
-
-    sam1_images = images.sam1_images
-    sam1_images_size = images.sam1_images_size
-    np_images = images.np_images
-    np_images_size = images.np_images_size
     
-    sam1_masks = get_mask_from_img_sam1(pe3r.mobilesamv2, pe3r.yolov8, sam1_images[0], np_images[0], np_images_size[0], sam1_images_size[0], images.sam1_transform)
-    for mask in sam1_masks:
-        _, _, _ = pe3r.sam2.add_new_mask(
-            inference_state=inference_state,
-            frame_idx=0,
-            obj_id=mask_num,
-            mask=mask,
-        )
-        mask_num += 1
+    # 더미 데이터 생성 (기존 포맷 유지)
+    for i in range(len(np_images)):
+        h, w = np_images[i].shape[:2]
+        # 세그멘테이션 맵을 -1(배경)로 채움
+        dummy_map = -np.ones((h, w), dtype=np.int64)
+        cog_seg_maps.append(dummy_map)
+        rev_cog_seg_maps.append(dummy_map)
 
-    video_segments = {}  # video_segments contains the per-frame segmentation results
-    for out_frame_idx, out_obj_ids, out_mask_logits in pe3r.sam2.propagate_in_video(inference_state):
-        sam2_masks = (out_mask_logits > 0.0).squeeze(1)
-
-        video_segments[out_frame_idx] = {
-            out_obj_id: sam2_masks[i].cpu().numpy()
-            for i, out_obj_id in enumerate(out_obj_ids)
-        }
-
-        if out_frame_idx == 0:
-            continue
-
-        sam1_masks = get_mask_from_img_sam1(pe3r.mobilesamv2, pe3r.yolov8, sam1_images[out_frame_idx], np_images[out_frame_idx], np_images_size[out_frame_idx], sam1_images_size[out_frame_idx], images.sam1_transform)
-
-        for sam1_mask in sam1_masks:
-            flg = 1
-            for sam2_mask in sam2_masks:
-                # print(sam1_mask.shape, sam2_mask.shape)
-                area1 = sam1_mask.sum()
-                area2 = sam2_mask.sum()
-                intersection = (sam1_mask & sam2_mask).sum()
-                if min(intersection / area1, intersection / area2) > 0.25:
-                    flg = 0
-                    break
-            if flg:
-                video_segments[out_frame_idx][mask_num] = sam1_mask.cpu().numpy()
-                mask_num += 1
-
-    multi_view_clip_feats = torch.zeros((mask_num+1, 1024))
-    multi_view_clip_feats_map = {}
-    multi_view_clip_area_map = {}
-    for now_frame in range(0, len(video_segments), 1):
-        image = np_images[now_frame]
-
-        seg_img_list = []
-        out_obj_id_list = []
-        out_obj_mask_list = []
-        out_obj_area_list = []
-        # NOTE: background: -1
-        rev_seg_map = -np.ones(image.shape[:2], dtype=np.int64)
-        sorted_dict_items = sorted(video_segments[now_frame].items(), key=lambda x: np.count_nonzero(x[1]), reverse=False)
-        for out_obj_id, mask in sorted_dict_items:
-            if mask.sum() == 0:
-                continue
-            rev_seg_map[mask] = out_obj_id
-        rev_cog_seg_maps.append(rev_seg_map)
-
-        seg_map = -np.ones(image.shape[:2], dtype=np.int64)
-        sorted_dict_items = sorted(video_segments[now_frame].items(), key=lambda x: np.count_nonzero(x[1]), reverse=True)
-        for out_obj_id, mask in sorted_dict_items:
-            if mask.sum() == 0:
-                continue
-            box = np.int32(box_xyxy_to_xywh(mask_to_box(mask)))
-            
-            if box[2] == 0 and box[3] == 0:
-                continue
-            # print(box)
-            seg_img = get_seg_img(mask, box, image)
-            pad_seg_img = cv2.resize(pad_img(seg_img), (256,256))
-            seg_img_list.append(pad_seg_img)
-            seg_map[mask] = out_obj_id
-            out_obj_id_list.append(out_obj_id)
-            out_obj_area_list.append(np.count_nonzero(mask))
-            out_obj_mask_list.append(mask)
-
-        if len(seg_img_list) == 0:
-            cog_seg_maps.append(seg_map)
-            continue
-
-        seg_imgs = np.stack(seg_img_list, axis=0) # b,H,W,3
-        seg_imgs = torch.from_numpy(seg_imgs).permute(0,3,1,2) # / 255.0
-        
-        inputs = pe3r.siglip_processor(images=seg_imgs, return_tensors="pt")
-        inputs = {key: value.to("cuda") for key, value in inputs.items()}
-        
-        image_features = pe3r.siglip.get_image_features(**inputs)
-        image_features = image_features / image_features.norm(dim=-1, keepdim=True)
-        image_features = image_features.detach().cpu()
-
-        for i in range(len(out_obj_mask_list)):
-            for j in range(i + 1, len(out_obj_mask_list)):
-                mask1 = out_obj_mask_list[i]
-                mask2 = out_obj_mask_list[j]
-                intersection = np.logical_and(mask1, mask2).sum()
-                area1 = out_obj_area_list[i]
-                area2 = out_obj_area_list[j]
-                if min(intersection / area1, intersection / area2) > 0.025:
-                    conf1 = area1 / (area1 + area2)
-                    # conf2 = area2 / (area1 + area2)
-                    image_features[j] = slerp(image_features[j], image_features[i], conf1)
-
-        for i, clip_feat in enumerate(image_features):
-            id = out_obj_id_list[i]
-            if id in multi_view_clip_feats_map.keys():
-                multi_view_clip_feats_map[id].append(clip_feat)
-                multi_view_clip_area_map[id].append(out_obj_area_list[i])
-            else:
-                multi_view_clip_feats_map[id] = [clip_feat]
-                multi_view_clip_area_map[id] = [out_obj_area_list[i]]
-
-        cog_seg_maps.append(seg_map)
-        del image_features
-        
-    for i in range(mask_num):
-        if i in multi_view_clip_feats_map.keys():
-            clip_feats = multi_view_clip_feats_map[i]
-            mask_area = multi_view_clip_area_map[i]
-            multi_view_clip_feats[i] = slerp_multiple(torch.stack(clip_feats), np.stack(mask_area))
-        else:
-            multi_view_clip_feats[i] = torch.zeros((1024))
-    multi_view_clip_feats[mask_num] = torch.zeros((1024))
+    # 더미 Feature (N, 1024) - N=1 (배경만 있음)
+    multi_view_clip_feats = torch.zeros((1, 1024))
 
     return cog_seg_maps, rev_cog_seg_maps, multi_view_clip_feats
-
 
 def get_reconstructed_scene(outdir, pe3r, device, silent, filelist, schedule, niter, min_conf_thr,
                             as_pointcloud, mask_sky, clean_depth, transparent_cams, cam_size,
@@ -504,19 +430,84 @@ def get_reconstructed_scene(outdir, pe3r, device, silent, filelist, schedule, ni
     return scene, outfile, imgs
 
 
+import copy # 코드 상단에 추가 필요
+
 def get_3D_object_from_scene(outdir, pe3r, silent, text, threshold, scene, min_conf_thr, as_pointcloud, 
                  mask_sky, clean_depth, transparent_cams, cam_size):
     
-    texts = [text]
-    inputs = pe3r.siglip_tokenizer(text=texts, padding="max_length", return_tensors="pt")
-    inputs = {key: value.to("cuda") for key, value in inputs.items()}
-    with torch.no_grad():
-        text_feats =pe3r.siglip.get_text_features(**inputs)
-        text_feats = text_feats / text_feats.norm(dim=-1, keepdim=True)
-    scene.render_image(text_feats, threshold)
-    scene.ori_imgs = scene.rendered_imgs
+    # -------------------------------------------------------------------
+    # [수정 1] 원본 이미지 백업 로직 추가
+    # -------------------------------------------------------------------
+    # scene 객체에 'backup_imgs'가 없다면(첫 실행이라면), 현재 이미지를 원본으로 저장
+    if not hasattr(scene, 'backup_imgs'):
+        # 리스트 내부의 numpy 배열까지 안전하게 복사하기 위해 deepcopy 사용 권장
+        # 만약 deepcopy가 너무 느리다면: scene.backup_imgs = [img.copy() for img in scene.ori_imgs]
+        scene.backup_imgs = [img.copy() for img in scene.ori_imgs]
+        print("DEBUG: Original images backed up.")
+
+    print(f"Searching for: '{text}' using YOLO-World...")
+
+    # 1. YOLO-World 클래스 설정
+    search_classes = [text] 
+    pe3r.seg_model.set_classes(search_classes)
+
+    # -------------------------------------------------------------------
+    # [수정 2] 검색 대상 이미지를 'scene.ori_imgs'가 아닌 '백업본'에서 가져옴
+    # -------------------------------------------------------------------
+    # 항상 깨끗한 원본에서 검색을 시작함
+    original_images = scene.backup_imgs 
+    masked_images = []
+
+    # 3. 각 이미지에 대해 YOLO-World 추론 수행
+    for i, img in enumerate(original_images):
+        # 이미지 포맷 보정
+        img_input = img.copy()
+        if img_input.dtype != np.uint8:
+            if img_input.max() <= 1.0:
+                img_input = (img_input * 255).astype(np.uint8)
+            else:
+                img_input = img_input.astype(np.uint8)
+
+        # 추론 (Confidence Threshold 설정)
+        conf_thr = 0.05 
+        
+        # YOLO 추론
+        results = pe3r.seg_model.predict(img_input, conf=conf_thr, retina_masks=True, verbose=False)
+        
+        # 마스크 합치기
+        combined_mask = np.zeros(img.shape[:2], dtype=bool)
+        found = False
+
+        if results[0].masks is not None:
+            masks = results[0].masks.data.cpu().numpy()
+            for mask in masks:
+                if mask.shape != combined_mask.shape:
+                    mask = cv2.resize(mask, (combined_mask.shape[1], combined_mask.shape[0]))
+                combined_mask = np.logical_or(combined_mask, mask > 0.5)
+                found = True
+        
+        # 4. 이미지 마스킹 처리
+        if found:
+            masked_img = img.copy()
+            if img.dtype == np.uint8:
+                # 찾은 물체 외에는 어둡게 처리 (30)
+                masked_img[~combined_mask] = 30 
+            else:
+                masked_img[~combined_mask] = 0.1 
+            masked_images.append(masked_img)
+        else:
+            # 못 찾았으면 전체를 어둡게
+            masked_images.append(img * 0.1)
+
+    # 5. Scene의 이미지를 마스킹된 이미지로 교체 (뷰어용)
+    # 원본(backup)은 건드리지 않고, 현재 보여주는 이미지(ori_imgs, imgs)만 교체
+    scene.ori_imgs = masked_images
+    scene.imgs = masked_images 
+
+    # 6. GLB 모델 추출
     outfile = get_3D_model_from_scene(outdir, silent, scene, min_conf_thr, as_pointcloud, mask_sky,
                                       clean_depth, transparent_cams, cam_size)
+    
     return outfile
 
 
@@ -642,4 +633,5 @@ def main_demo(tmpdirname, pe3r, device, server_name, server_port, silent=False):
                              inputs=[text_input, threshold, scene, min_conf_thr, as_pointcloud, mask_sky,
                                       clean_depth, transparent_cams, cam_size],
                             outputs=outmodel)
-    demo.launch(share=False, server_name=server_name, server_port=server_port)
+    demo.launch(share=True, server_name=server_name, server_port=server_port)
+
