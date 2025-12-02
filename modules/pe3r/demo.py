@@ -23,8 +23,12 @@ from copy import deepcopy
 import cv2
 from typing import Any, Dict, Generator,List
 import matplotlib.pyplot as pl
+import glob
 
 from modules.mobilesamv2.utils.transforms import ResizeLongestSide
+from modules.llm_final_api.main_report import main_report
+from modules.llm_final_api.main_new_looks import main_new_looks
+from modules.llm_final_api.main_modify_looks import main_modify_looks
 
 
 def _convert_scene_output_to_glb(outdir, imgs, pts3d, mask, focals, cams2world, cam_size=0.05,
@@ -532,106 +536,403 @@ def set_scenegraph_options(inputfiles, winsize, refid, scenegraph_type):
     return winsize, refid
 
 
+import gradio as gr
+import functools
+import os
+import sys
+import json
+# [참고] 외부 함수들은 그대로 유지
+# get_reconstructed_scene, get_3D_model_from_scene, get_3D_object_from_scene, set_scenegraph_options
+
 def main_demo(tmpdirname, pe3r, device, server_name, server_port, silent=False):
-#    scene, outfile, imgs = get_reconstructed_scene(
-#         outdir=tmpdirname,  pe3r=pe3r, device=device, silent=silent,
-#         filelist=['/home/hujie/pe3r/datasets/mipnerf360_ov/bonsai/black_chair/images/DSCF5590.png',
-#                   '/home/hujie/pe3r/datasets/mipnerf360_ov/bonsai/black_chair/images/DSCF5602.png',
-#                   '/home/hujie/pe3r/datasets/mipnerf360_ov/bonsai/black_chair/images/DSCF5609.png'],
-#         schedule="linear", niter=300, min_conf_thr=3.0, as_pointcloud=False, mask_sky=True, clean_depth=True, transparent_cams=False, 
-#         cam_size=0.05, scenegraph_type="complete", winsize=1, refid=0)
     
+    # 1. 3D 모델 생성 로직
     recon_fun = functools.partial(get_reconstructed_scene, tmpdirname, pe3r, device, silent)
     model_from_scene_fun = functools.partial(get_3D_model_from_scene, tmpdirname, silent)
     get_3D_object_from_scene_fun = functools.partial(get_3D_object_from_scene, tmpdirname, pe3r, silent)
 
-    with gradio.Blocks(css=""".gradio-container {margin: 0 !important; min-width: 100%};""", title="PE3R Demo") as demo:
-        # scene state is save so that you can change conf_thr, cam_size... without rerunning the inference
-        scene = gradio.State(None)
-        gradio.HTML('<h2 style="text-align: center;">PE3R Demo</h2>')
-        with gradio.Column():
-            inputfiles = gradio.File(file_count="multiple")
-            with gradio.Row():
-                schedule = gradio.Dropdown(["linear", "cosine"],
-                                           value='linear', label="schedule", info="For global alignment!",
-                                           visible=False)
-                niter = gradio.Number(value=300, precision=0, minimum=0, maximum=5000,
-                                      label="num_iterations", info="For global alignment!",
-                                      visible=False)
-                scenegraph_type = gradio.Dropdown([("complete: all possible image pairs", "complete"),
-                                                   ("swin: sliding window", "swin"),
-                                                   ("oneref: match one image with all", "oneref")],
-                                                  value='complete', label="Scenegraph",
-                                                  info="Define how to make pairs",
-                                                  interactive=True,
-                                                  visible=False)
-                winsize = gradio.Slider(label="Scene Graph: Window Size", value=1,
-                                        minimum=1, maximum=1, step=1, visible=False)
-                refid = gradio.Slider(label="Scene Graph: Id", value=0, minimum=0, maximum=0, step=1, visible=False)
+    def save_style_json(selected_style):
+        """스타일 선택 시 style_choice.json 저장"""
+        data = {"selected_style": selected_style}
+        try:
+            with open("modules/llm_final_api/style_choice.json", "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=4)
+            print(f"💾 [Saved] style_choice.json: {data}")
+        except Exception as e:
+            print(f"❌ [Error] 스타일 저장 실패: {e}")
 
-            run_btn = gradio.Button("Reconstruct")
+    def save_user_choice_json(use_add, use_remove, use_change):
+        """체크박스 변경 시 user_choice.json 저장"""
+        data = {
+            "use_add": use_add,
+            "use_remove": use_remove,
+            "use_change": use_change
+        }
+        try:
+            with open("modules/llm_final_api/user_choice.json", "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=4)
+            print(f"💾 [Saved] user_choice.json: {data}")
+        except Exception as e:
+            print(f"❌ [Error] 유저 선택 저장 실패: {e}")
 
-            with gradio.Row():
-                # adjust the confidence threshold
-                min_conf_thr = gradio.Slider(label="min_conf_thr", value=3.0, minimum=1.0, maximum=20, step=0.1, visible=False)
-                # adjust the camera size in the output pointcloud
-                cam_size = gradio.Slider(label="cam_size", value=0.05, minimum=0.001, maximum=0.1, step=0.001, visible=False)
-            with gradio.Row():
-                as_pointcloud = gradio.Checkbox(value=True, label="As pointcloud")
-                # two post process implemented
-                mask_sky = gradio.Checkbox(value=False, label="Mask sky", visible=False)
-                clean_depth = gradio.Checkbox(value=True, label="Clean-up depthmaps", visible=False)
-                transparent_cams = gradio.Checkbox(value=True, label="Transparent cameras")
+    # -------------------------------------------------------------------------
+    # [수정됨] 분석 및 UI 업데이트 전담 함수
+    # -------------------------------------------------------------------------
+    def read_report_file(filename="report_analysis_result.txt"):
+        if os.path.exists(filename):
+            try:
+                with open(filename, "r", encoding="utf-8") as f:
+                    return f.read()
+            except Exception as e:
+                return f"파일 읽기 오류: {str(e)}"
+        return "⚠️ 분석 결과 파일이 생성되지 않았습니다."
 
-            with gradio.Row():
-                text_input = gradio.Textbox(label="Query Text")
-                threshold = gradio.Slider(label="Threshold", value=0.85, minimum=0.0, maximum=1.0, step=0.01)
+    def run_analysis_and_show_ui(input_files):
+        """
+        분석을 수행하고 -> 결과 텍스트와 -> 아코디언을 보이게 하는 명령을 함께 반환
+        """
+        #1. 이미지 경로 추출
+        image_paths = []
+        if input_files:
+            for f in input_files:
+                path = f.name if hasattr(f, 'name') else f
+                image_paths.append(path)
+        
+        # 2. 분석 실행
+        if main_report:
+            try:
+                print(f"📊 [Info] 이미지 분석 시작 ({len(image_paths)}장)...")
+                # main_report(image_paths) # 함수명이 report라고 가정 (코드에 맞게 수정 필요)
+                # 혹시 함수명이 run_analysis라면 아래 주석 해제
+                main_report(image_paths) 
+            except Exception as e:
+                print(f"❌ [Error] 분석 모듈 실행 실패: {e}")
+                # 에러가 나도 아코디언은 띄우지 않거나, 에러 로그를 리턴
+                return f"### 분석 오류 발생\n{str(e)}", gr.update(visible=False)
+        else:
+            return "### 분석 모듈 로드 실패\nmain_report.py를 찾을 수 없습니다.", gr.update(visible=False)
 
-            find_btn = gradio.Button("Find")
+        # 3. 결과 반환 (텍스트, 아코디언 보이기 Update)
+        report_text = read_report_file("report_analysis_result.txt")
+        return report_text, gr.update(visible=True, open=True), gr.update(visible=True, open=True)
+    
+    def generate_and_load_new_images():
+        """
+        1. main_new_looks 실행
+        2. apioutput_style 폴더의 이미지 파일들을 inputfiles로 반환
+        """
+        # 1. 생성 모듈 실행
+        if main_new_looks:
+            try:
+                print("🎨 [Info] 새로운 룩 생성 시작...")
+                main_new_looks()
+            except Exception as e:
+                print(f"❌ [Error] 이미지 생성 실패: {e}")
+                # 에러 발생 시 빈 리스트 반환보다는 None을 반환하거나 에러 처리
+        else:
+            print("⚠️ Error: main_new_looks 모듈이 로드되지 않았습니다.")
 
-            outmodel = gradio.Model3D()
-            outgallery = gradio.Gallery(label='rgb,depth,confidence', columns=3, height="100%",
-                                        visible=False)
+        # 2. apioutput 폴더에서 파일 가져오기
+        output_dir = os.path.join(os.getcwd(), "apioutput")
+        if not os.path.exists(output_dir):
+            print(f"⚠️ Warning: {output_dir} 폴더가 존재하지 않습니다.")
+            return []
 
-            # events
-            scenegraph_type.change(set_scenegraph_options,
-                                   inputs=[inputfiles, winsize, refid, scenegraph_type],
-                                   outputs=[winsize, refid])
-            inputfiles.change(set_scenegraph_options,
-                              inputs=[inputfiles, winsize, refid, scenegraph_type],
-                              outputs=[winsize, refid])
-            run_btn.click(fn=recon_fun,
-                          inputs=[inputfiles, schedule, niter, min_conf_thr, as_pointcloud,
-                                  mask_sky, clean_depth, transparent_cams, cam_size,
-                                  scenegraph_type, winsize, refid],
-                          outputs=[scene, outmodel, outgallery])
-            min_conf_thr.release(fn=model_from_scene_fun,
-                                 inputs=[scene, min_conf_thr, as_pointcloud, mask_sky,
-                                         clean_depth, transparent_cams, cam_size],
-                                 outputs=outmodel)
-            cam_size.change(fn=model_from_scene_fun,
-                            inputs=[scene, min_conf_thr, as_pointcloud, mask_sky,
-                                    clean_depth, transparent_cams, cam_size],
-                            outputs=outmodel)
-            as_pointcloud.change(fn=model_from_scene_fun,
-                                 inputs=[scene, min_conf_thr, as_pointcloud, mask_sky,
-                                         clean_depth, transparent_cams, cam_size],
-                                 outputs=outmodel)
-            mask_sky.change(fn=model_from_scene_fun,
-                            inputs=[scene, min_conf_thr, as_pointcloud, mask_sky,
-                                    clean_depth, transparent_cams, cam_size],
-                            outputs=outmodel)
-            clean_depth.change(fn=model_from_scene_fun,
-                               inputs=[scene, min_conf_thr, as_pointcloud, mask_sky,
-                                       clean_depth, transparent_cams, cam_size],
-                               outputs=outmodel)
-            transparent_cams.change(model_from_scene_fun,
-                                    inputs=[scene, min_conf_thr, as_pointcloud, mask_sky,
-                                            clean_depth, transparent_cams, cam_size],
-                                    outputs=outmodel)
-            find_btn.click(fn=get_3D_object_from_scene_fun,
-                             inputs=[text_input, threshold, scene, min_conf_thr, as_pointcloud, mask_sky,
-                                      clean_depth, transparent_cams, cam_size],
-                            outputs=outmodel)
+        # png, jpg, jpeg 파일 검색
+        files = glob.glob(os.path.join(output_dir, "*.[pP][nN][gG]")) + \
+                glob.glob(os.path.join(output_dir, "*.[jJ][pP][gG]")) + \
+                glob.glob(os.path.join(output_dir, "*.[jJ][pP][eE][gG]"))
+        
+        # 최신 파일 3개만 가져오거나 전체를 가져옴 (요청사항: 3장의 이미지)
+        # 생성 순서대로 정렬 (수정 시간이 최신인 것)
+        files.sort(key=os.path.getmtime, reverse=True)
+        
+        selected_files = files[:3]
+        print(f"📂 [Info] 로드된 파일: {selected_files}")
+        
+        return selected_files
+    def generate_and_load_modified_images():
+        """
+        1. main_modify_looks 실행
+        2. apioutput_modify 폴더의 이미지 파일들을 inputfiles로 반환
+        """
+        # 1. 생성 모듈 실행
+        if main_modify_looks:
+            try:
+                print("🎨 [Info] 새로운 룩 생성 시작...")
+                main_modify_looks()
+            except Exception as e:
+                print(f"❌ [Error] 이미지 생성 실패: {e}")
+                # 에러 발생 시 빈 리스트 반환보다는 None을 반환하거나 에러 처리
+        else:
+            print("⚠️ Error: main_modify_looks 모듈이 로드되지 않았습니다.")
+
+        # 2. apioutput 폴더에서 파일 가져오기
+        output_dir = os.path.join(os.getcwd(), "apioutput")
+        if not os.path.exists(output_dir):
+            print(f"⚠️ Warning: {output_dir} 폴더가 존재하지 않습니다.")
+            return []
+
+        # png, jpg, jpeg 파일 검색
+        files = glob.glob(os.path.join(output_dir, "*.[pP][nN][gG]")) + \
+                glob.glob(os.path.join(output_dir, "*.[jJ][pP][gG]")) + \
+                glob.glob(os.path.join(output_dir, "*.[jJ][pP][eE][gG]"))
+        
+        # 최신 파일 3개만 가져오거나 전체를 가져옴 (요청사항: 3장의 이미지)
+        # 생성 순서대로 정렬 (수정 시간이 최신인 것)
+        files.sort(key=os.path.getmtime, reverse=True)
+        
+        selected_files = files[:3]
+        print(f"📂 [Info] 로드된 파일: {selected_files}")
+        
+        return selected_files
+    
+    # -------------------------------------------------------------------------
+    # [되돌리기(Revert) 관련 함수 - NEW]
+    # -------------------------------------------------------------------------
+    # 1. 초기 생성 시 백업 저장
+    def backup_original_scene(scene, input_files):
+        """Reconstruct 버튼 클릭 시 생성된 scene과 입력 파일을 백업"""
+        
+        # [수정된 부분] input_files 안에 있는 객체가 파일 래퍼인지 문자열인지 확인 후 '경로 문자열'만 저장
+        saved_paths = []
+        if input_files:
+            for f in input_files:
+                # f가 Gradio 파일 객체(_TemporaryFileWrapper)라면 .name을 가져오고,
+                # 이미 문자열(경로)라면 그대로 사용
+                path = f.name if hasattr(f, 'name') else f
+                saved_paths.append(path)
+        
+        print(f"💾 [Backup] Scene과 파일 {len(saved_paths)}개가 원본으로 백업되었습니다.")
+        
+        # 수정된 경로 리스트(saved_paths)를 저장해야 나중에 에러가 안 납니다.
+        return scene, saved_paths
+    
+    def backup_original_report(report_text):
+        """생성된 분석 리포트 텍스트를 백업"""
+        print("💾 [Backup] 분석 리포트 텍스트 백업 완료")
+        return report_text
+
+    # 2. 되돌리기 버튼 클릭 시 복구
+    def restore_original_scene(orig_scene, orig_inputs, orig_report, min_conf_thr, as_pointcloud, mask_sky, clean_depth, transparent_cams, cam_size):
+        """백업된 scene, 파일, 리포트를 복구하고 3D 모델 뷰어 업데이트"""
+        if orig_scene is None:
+            return gr.update(), gr.update(), gr.update(), "⚠️ 저장된 원본이 없습니다."
+        
+        # 저장된 scene 객체로부터 다시 3D 모델 파일 생성
+        restored_model_path = model_from_scene_fun(
+            orig_scene, min_conf_thr, as_pointcloud, mask_sky, clean_depth, transparent_cams, cam_size
+        )
+        
+        # 리포트 복구 (없을 경우 기본 메시지)
+        restored_report = orig_report if orig_report else "🔄 원본 리포트가 없습니다."
+
+        print("↩️ [Restore] 원본 Scene 및 리포트 되돌리기 완료")
+        
+        # 순서: Scene, 3D모델경로, 입력파일, 분석리포트텍스트
+        return orig_scene, restored_model_path, orig_inputs, restored_report
+
+    # -------------------------------------------------------------------------
+
+    with gr.Blocks(title="PE3R Demo", fill_width=True) as demo:
+        scene = gr.State(None)
+
+        # [NEW] 원본 복구를 위한 상태 변수
+        original_scene = gr.State(None)       
+        original_inputfiles = gr.State(None)
+        original_report_text = gr.State(None) # 리포트 백업용
+
+        gr.Markdown("## 🧊 PE3R Demo")
+
+        with gr.Row():
+            # --- 좌측 패널 ---
+            with gr.Column(scale=1, min_width=320):
+                inputfiles = gr.File(file_count="multiple", label="Input Images")
+                
+                with gr.Accordion("⚙️ Settings", open=False):
+                    schedule = gr.Dropdown(["linear", "cosine"], value='linear', label="schedule")
+                    niter = gr.Number(value=300, precision=0, label="num_iterations")
+                    scenegraph_type = gr.Dropdown(
+                        [("complete", "complete"), ("swin", "swin"), ("oneref", "oneref")],
+                        value='complete', label="Scenegraph"
+                    )
+                    winsize = gr.Slider(value=1, minimum=1, maximum=1, step=1, visible=False)
+                    refid = gr.Slider(value=0, minimum=0, maximum=0, step=1, visible=False)
+                    min_conf_thr = gr.Slider(label="min_conf_thr", value=3.0, minimum=1.0, maximum=20)
+                    cam_size = gr.Slider(label="cam_size", value=0.05, minimum=0.001, maximum=0.1)
+                    as_pointcloud = gr.Checkbox(value=True, label="As pointcloud")
+                    transparent_cams = gr.Checkbox(value=True, label="Transparent cameras")
+                    mask_sky = gr.Checkbox(value=False, visible=False)
+                    clean_depth = gr.Checkbox(value=True, visible=False)
+
+                run_btn = gr.Button("Reconstruct", variant="primary", elem_classes=["primary-btn"])
+                revert_btn = gr.Button("↩️ 원본 되돌리기", variant="secondary")
+                
+                # [수정됨] 초기에는 보이지 않도록 visible=False 설정
+                # 변수명(analysis_accordion)을 할당해야 나중에 업데이트 가능
+                with gr.Accordion("🎨 분석리포트 적용", open=True, visible=False) as analysis_accordion:
+                    add = gr.Checkbox(value=False, label="가구 배치 제안 반영해보기")
+                    delete = gr.Checkbox(value=False, label="가구 제거 제안 반영해보기")
+                    change = gr.Checkbox(value=False, label="가구 변경 제안 반영해보기")
+                    run_suggested_change_btn= gr.Button("결과 생성", variant="primary")
+                with gr.Accordion("방 분위기 바꿔보기", open=False, visible=False) as analysis_accordion1:
+                    style = gr.Dropdown(["AI 추천","미니멀리즘","맥시멀리즘"], label="style")
+                    run_style_change_btn = gr.Button("결과 생성", variant="primary")
+
+            # --- 우측 패널 ---
+            with gr.Column(scale=2):
+                outmodel = gr.Model3D(label="3D Reconstruction Result", interactive=True)
+                
+                analysis_output = gr.Markdown(
+                    value="여기에 공간 분석 결과가 표시됩니다.",
+                    label="공간 분석 리포트",
+                    elem_classes=["report-box"]
+                )
+                outgallery = gr.Gallery(visible=False)
+
+        # ---------------------------------------------------------------------
+        # [이벤트 흐름 1: 기본 Reconstruct 버튼 (원본 생성)]
+        # ---------------------------------------------------------------------
+        # 1. 3D 생성
+        recon_event = run_btn.click(
+            fn=recon_fun,
+            inputs=[inputfiles, schedule, niter, min_conf_thr, as_pointcloud,
+                    mask_sky, clean_depth, transparent_cams, cam_size,
+                    scenegraph_type, winsize, refid],
+            outputs=[scene, outmodel, outgallery]
+        )
+        
+        # 2. [Backup Scene] 생성 성공 시 Scene과 파일 백업
+        recon_event.success(
+            fn=backup_original_scene,
+            inputs=[scene, inputfiles],
+            outputs=[original_scene, original_inputfiles]
+        )
+
+        # 3. 로딩 메시지
+        analysis_step = recon_event.then(
+            fn=lambda: "⏳ 3D 생성이 완료되었습니다. 공간 분위기를 분석 중입니다...",
+            inputs=None,
+            outputs=analysis_output
+        )
+
+        # 4. 분석 결과 표시
+        finish_analysis_step = analysis_step.then(
+            fn=run_analysis_and_show_ui,
+            inputs=[inputfiles],
+            outputs=[analysis_output, analysis_accordion, analysis_accordion1]
+        )
+
+        # 5. [Backup Report] 분석이 끝나고 UI에 표시된 후, 그 텍스트를 백업
+        finish_analysis_step.success(
+            fn=backup_original_report,
+            inputs=[analysis_output], # 화면에 출력된 텍스트를 가져옴
+            outputs=[original_report_text]
+        )
+
+        # ---------------------------------------------------------------------
+        # [이벤트 흐름 2: 되돌리기 (Revert) 버튼]
+        # ---------------------------------------------------------------------
+        revert_btn.click(
+            fn=restore_original_scene,
+            # 원본 데이터(Scene, 파일, 리포트) + 시각화 옵션들을 입력으로 받음
+            inputs=[original_scene, original_inputfiles, original_report_text, 
+                    min_conf_thr, as_pointcloud, mask_sky, clean_depth, transparent_cams, cam_size],
+            # 현재 상태 업데이트
+            outputs=[scene, outmodel, inputfiles, analysis_output]
+        )
+
+        #------------------------------------------------
+        # 스타일변경
+        #------------------------------------------------
+
+        suggestion_event = run_style_change_btn.click(
+            fn=generate_and_load_new_images,
+            inputs=None,
+            outputs=inputfiles  # apioutput의 이미지들이 여기로 들어감
+        )
+
+        # 2. 업데이트된 InputFiles로 Reconstruct 자동 실행 (run_btn 로직 복제)
+        # 주의: inputs에 [inputfiles, ...] 를 넣으면 갱신된 파일이 들어갑니다.
+        suggestion_recon_event = suggestion_event.then(
+            fn=recon_fun,
+            inputs=[inputfiles, schedule, niter, min_conf_thr, as_pointcloud,
+                    mask_sky, clean_depth, transparent_cams, cam_size,
+                    scenegraph_type, winsize, refid],
+            outputs=[scene, outmodel, outgallery]
+        )
+
+        # 3. 분석 메시지 표시
+        suggestion_analysis_step = suggestion_recon_event.then(
+            fn=lambda: "⏳ 새로운 디자인을 3D로 변환 중입니다. 다시 분석 중...",
+            inputs=None,
+            outputs=analysis_output
+        )
+
+        # 4. 분석 결과 다시 표시
+        suggestion_analysis_step.then(
+            fn=run_analysis_and_show_ui,
+            inputs=[inputfiles],
+            outputs=[analysis_output, analysis_accordion, analysis_accordion1]
+        )
+
+        #------------------------------------------------------------
+        # modify
+        # ----------------------------------------------------------
+
+
+        modify_event = run_suggested_change_btn.click(
+            fn=generate_and_load_modified_images,
+            inputs=None,
+            outputs=inputfiles  # apioutput의 이미지들이 여기로 들어감
+        )
+
+        # 2. 업데이트된 InputFiles로 Reconstruct 자동 실행 (run_btn 로직 복제)
+        # 주의: inputs에 [inputfiles, ...] 를 넣으면 갱신된 파일이 들어갑니다.
+        modify_recon_event = modify_event.then(
+            fn=recon_fun,
+            inputs=[inputfiles, schedule, niter, min_conf_thr, as_pointcloud,
+                    mask_sky, clean_depth, transparent_cams, cam_size,
+                    scenegraph_type, winsize, refid],
+            outputs=[scene, outmodel, outgallery]
+        )
+
+        # 3. 분석 메시지 표시
+        modify_analysis_step = modify_recon_event.then(
+            fn=lambda: "⏳ 새로운 디자인을 3D로 변환 중입니다. 다시 분석 중...",
+            inputs=None,
+            outputs=analysis_output
+        )
+
+        # 4. 분석 결과 다시 표시
+        modify_analysis_step.then(
+            fn=run_analysis_and_show_ui,
+            inputs=[inputfiles],
+            outputs=[analysis_output, analysis_accordion, analysis_accordion1]
+        )
+
+        #----------------------------------------------------------
+        # 이외 설정값 변경
+        # -------------------------------------------------------
+        style.change(fn=save_style_json, inputs=[style], outputs=None)
+
+        checkbox_inputs = [add, delete, change]
+        add.change(fn=save_user_choice_json, inputs=checkbox_inputs, outputs=None)
+        delete.change(fn=save_user_choice_json, inputs=checkbox_inputs, outputs=None)
+        change.change(fn=save_user_choice_json, inputs=checkbox_inputs, outputs=None)
+
+
+
+        # --- 나머지 이벤트 연결 (기존 유지) ---
+        scenegraph_type.change(set_scenegraph_options, [inputfiles, winsize, refid, scenegraph_type], [winsize, refid])
+        inputfiles.change(set_scenegraph_options, [inputfiles, winsize, refid, scenegraph_type], [winsize, refid])
+        
+        update_inputs = [scene, min_conf_thr, as_pointcloud, mask_sky, clean_depth, transparent_cams, cam_size]
+        min_conf_thr.release(fn=model_from_scene_fun, inputs=update_inputs, outputs=outmodel)
+        cam_size.change(fn=model_from_scene_fun, inputs=update_inputs, outputs=outmodel)
+        as_pointcloud.change(fn=model_from_scene_fun, inputs=update_inputs, outputs=outmodel)
+        mask_sky.change(fn=model_from_scene_fun, inputs=update_inputs, outputs=outmodel)
+        clean_depth.change(fn=model_from_scene_fun, inputs=update_inputs, outputs=outmodel)
+        transparent_cams.change(model_from_scene_fun, inputs=update_inputs, outputs=outmodel)
+
     demo.launch(share=True, server_name=server_name, server_port=server_port)
-
