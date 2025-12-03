@@ -13,18 +13,18 @@ import os
 import json
 import shutil
 
-from config import (
+from .config import (
     API_KEY,
     STYLE_MODEL,
     SELECTED_IMAGE_PATH,
 )
 
-from style.style_client import run_style_model
-from style.style_prompt import generate_style_prompt
-from main_1img23 import make_one_image_to_three   
+from .style.style_client import run_style_model
+from .style.style_prompt import generate_style_prompt
+from .main_1img23 import make_one_image_to_three   
 
 PARSED_REPORT_PATH = "parsed_report.json"
-STYLE_CHOICE_PATH = "style_choice.json"
+STYLE_CHOICE_PATH = "modules/llm_final_api/style_choice.json"
 ORG_IMAGE_PATH = "img4new3r_org.png"  # 최종 결과물 이름
 
 
@@ -73,7 +73,7 @@ def decide_target_style(parsed_report: dict, style_choice: dict) -> str:
 
 
 # 메인 실행
-def main():
+def main_new_looks():
 
     # 1. 입력 데이터
     try:
@@ -127,8 +127,8 @@ def main():
             f.write(image_bytes)
 
         # 최종본은 항상 ORG_IMAGE_PATH 로 통일
-        shutil.copyfile(temp_output, ORG_IMAGE_PATH)
-        styled_image_path = ORG_IMAGE_PATH
+        styled_image_path = os.path.join('apioutput',ORG_IMAGE_PATH)
+        shutil.copyfile(temp_output, styled_image_path)
 
         print(f"스타일 변경 이미지 저장 완료: {styled_image_path}")
 
@@ -150,7 +150,3 @@ def main():
         print("   - img4new3r_right.png")
     except Exception as e:
         print(f"좌/우 각도 생성(4단계) 중 에러 발생: {e}")
-
-
-if __name__ == "__main__":
-    main()

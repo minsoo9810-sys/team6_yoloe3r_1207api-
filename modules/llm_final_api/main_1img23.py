@@ -3,7 +3,7 @@ from google import genai
 from google.genai import types
 from PIL import Image # 이미지 저장 및 처리 
 import io # 바이트 스트림 처리 
-from config import API_KEY, STYLE_MODEL
+from .config import API_KEY, STYLE_MODEL
 
 def make_one_image_to_three(api_key: str, model_name: str, input_image_path: str):
     """
@@ -147,8 +147,9 @@ def make_one_image_to_three(api_key: str, model_name: str, input_image_path: str
                         
                         # 바이트 데이터를 이미지 파일로 저장.
                         img = Image.open(io.BytesIO(image_data))
-                        img.save(output_filename)
-                        print(f"   저장 완료: {output_filename}")
+                        filepath = os.path.join('apioutput',output_filename)
+                        img.save(filepath)
+                        print(f"   저장 완료: {filepath}")
                         break # 이미지를 하나 찾으면 저장하고 다음 태스크로.
                 else:
                     # 루프가 break 없이 끝났다면 이미지가 없다는 뜻.

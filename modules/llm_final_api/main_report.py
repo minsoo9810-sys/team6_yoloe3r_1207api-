@@ -1,11 +1,12 @@
 import time
 import json
 # 1. 상대 경로 임포트를 절대 경로 임포트로 수정
-from config import * 
-from report.utils.report_parser import parse_report_output
-from report.report_client import run_report_model
-from report.report_prompt import report_prompt
+from .config import * 
+from .report.utils.report_parser import parse_report_output
+from .report.report_client import run_report_model
+from .report.report_prompt import report_prompt
 from ultralytics import YOLOE # select_best_image 로직을 YOLOE로 대체했으므로 
+import shutil
 
 def main_report(img_path):
     # ----- 1단계: YOLOE를 이용한 최적의 입력 이미지 1장 선택 ------
@@ -27,6 +28,7 @@ def main_report(img_path):
 
     final_input_path = img_path[max_idx]
     print('최적 입력 이미지 : ' + final_input_path)
+    shutil.copyfile(img_path[max_idx], SELECTED_IMAGE_PATH)
 
     # ------ 2단계: 공간 분석 리포트 생성 ------
     try:

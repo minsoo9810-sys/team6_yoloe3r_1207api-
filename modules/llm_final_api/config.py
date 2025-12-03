@@ -15,7 +15,7 @@ load_dotenv()
 # --- API 키 설정 ---
 # 환경 변수에서 API_KEY 값을 가져와 적용합니다.
 # 만약 .env 파일에 키가 없다면, 두 번째 인수의 값(None)이 사용됩니다.
-API_KEY = os.getenv("API_KEY") 
+API_KEY = "APIKEY"
 
 # API 키가 제대로 로드되었는지 확인 (선택 사항)
 if not API_KEY:
@@ -24,9 +24,9 @@ if not API_KEY:
 # 3장의 최초 입력 이미지 경로
 # 이때 이미지는 각각 왼쪽 30도(-30), 정면, 오른쪽 30도(30)
 INITIAL_IMAGE_PATHS = [
-    "C:/Users/minso/Desktop/report_3imgs/room_30degree.jpg", 
-    "C:/Users/minso/Desktop/report_3imgs/room_original.jpg",
-    "C:/Users/minso/Desktop/report_3imgs/room_-30degree.jpg"
+    "modules/llm_final_api/input_image/test1.png", 
+    "modules/llm_final_api/input_image/test2.png",
+    "modules/llm_final_api/input_image/test3.png"
 ]
 
 # 3장 중 AI가 선택한 '최적 이미지'가 임시로 저장될 경로
