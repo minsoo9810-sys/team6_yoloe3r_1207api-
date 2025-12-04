@@ -37,6 +37,7 @@ idna==3.11
 iopath==0.1.10
 Jinja2==3.1.6
 kiwisolver==1.4.9
+lap==0.5.12
 markdown-it-py==4.0.0
 MarkupSafe==2.1.5
 matplotlib==3.10.7

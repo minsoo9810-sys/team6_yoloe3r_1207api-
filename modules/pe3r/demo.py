@@ -519,6 +519,86 @@ def get_3D_object_from_scene(outdir, pe3r, silent, text, threshold, scene, min_c
     
     return outfile
 
+def highlight_selected_object(
+    scene, mask_list, object_id_list,  # 입력 데이터
+    min_conf_thr, as_pointcloud, mask_sky, clean_depth, transparent_cams, cam_size, # 설정값
+    evt: gradio.SelectData, # 클릭 이벤트 데이터 (입력값 뒤에 배치)
+    outdir=None # 경로 (마지막에 키워드로 받음)
+): 
+    """
+    갤러리 선택 시 호출되는 함수
+    """
+    # 1. 예외 처리: 데이터가 없거나 이벤트가 잘못 들어온 경우
+    if scene is None or not mask_list:
+        print("⚠️ Scene or mask_list is empty.")
+        return None
+
+    if evt is None or not isinstance(evt, gradio.SelectData):
+        print(f"⚠️ Error: evt is {type(evt)}. Gradio failed to pass SelectData.")
+        return None
+
+    # 2. 선택된 인덱스 가져오기
+    selected_index = evt.index
+    print(f"🖱️ Clicked index: {selected_index}")
+
+    if selected_index >= len(object_id_list):
+        print("Error: Index out of range")
+        return None
+        
+    target_obj_id = object_id_list[selected_index] 
+    print(f"🎯 [Highlight] Target Object: {target_obj_id}")
+
+    # 3. Scene 백업 확인 (원본 보존)
+    if not hasattr(scene, 'backup_imgs'):
+        scene.backup_imgs = [img.copy() for img in scene.ori_imgs]
+
+    # 4. 마스크 적용 로직
+    masked_images = []
+    original_images = scene.backup_imgs
+    
+    for i, img in enumerate(original_images):
+        current_frame_masks = mask_list[i]
+        
+        target_mask = None
+        if target_obj_id in current_frame_masks:
+            target_mask = current_frame_masks[target_obj_id]
+        
+        img_h, img_w = img.shape[:2]
+        processed_img = img.copy()
+        
+        # 마스크 처리 (선택된 객체 외에는 어둡게)
+        if target_mask is not None:
+            # 크기 보정
+            if target_mask.shape[:2] != (img_h, img_w):
+                target_mask = cv2.resize(target_mask.astype(np.uint8), (img_w, img_h), interpolation=cv2.INTER_NEAREST).astype(bool)
+            
+            if processed_img.dtype == np.uint8:
+                processed_img[~target_mask] = 30
+            else:
+                processed_img[~target_mask] = 0.1
+        else:
+            # 객체가 없는 프레임은 전체 어둡게
+            if processed_img.dtype == np.uint8:
+                processed_img[:] = 30
+            else:
+                processed_img[:] = 0.1
+                
+        masked_images.append(processed_img)
+
+    # 5. Scene 이미지 교체
+    scene.ori_imgs = masked_images
+    scene.imgs = masked_images
+
+    # 6. 3D 모델 재생성
+    if outdir is None:
+        print("Error: outdir is None")
+        return None
+
+    outfile = get_3D_model_from_scene(outdir, False, scene, min_conf_thr, as_pointcloud, mask_sky, 
+                                      clean_depth, transparent_cams, cam_size)
+    
+    return outfile
+
 
 def set_scenegraph_options(inputfiles, winsize, refid, scenegraph_type):
     num_files = len(inputfiles) if inputfiles is not None else 1
@@ -724,7 +804,24 @@ def main_demo(tmpdirname, pe3r, device, server_name, server_port, silent=False):
         if orig_scene is None:
             return gr.update(), gr.update(), gr.update(), "⚠️ 저장된 원본이 없습니다."
         
+        # -------------------------------------------------------------------
+        # [핵심 수정] 이미지 원상복구 로직 추가
+        # -------------------------------------------------------------------
+        # get_3D_object_from_scene에서 'backup_imgs'를 만들어 두었으므로,
+        # 되돌리기 시 이 백업본을 다시 메인 이미지(ori_imgs, imgs)로 덮어씌워야 합니다.
+        if hasattr(orig_scene, 'backup_imgs'):
+            print("🔄 [Restore] 마스킹된 이미지를 원본으로 복구 중...")
+            # 리스트 컴프리헨션으로 안전하게 복사
+            orig_scene.ori_imgs = [img.copy() for img in orig_scene.backup_imgs]
+            orig_scene.imgs = [img.copy() for img in orig_scene.backup_imgs]
+            
+            # (선택 사항) 복구 후 백업본을 삭제하고 싶다면 아래 주석 해제
+            # del orig_scene.backup_imgs 
+            # 하지만 검색을 또 할 수도 있으니 놔두는 것을 추천합니다.
+        # -------------------------------------------------------------------
+
         # 저장된 scene 객체로부터 다시 3D 모델 파일 생성
+        # (이제 orig_scene의 이미지가 밝은 원본으로 돌아왔으므로 밝은 모델이 생성됨)
         restored_model_path = model_from_scene_fun(
             orig_scene, min_conf_thr, as_pointcloud, mask_sky, clean_depth, transparent_cams, cam_size
         )
@@ -752,10 +849,9 @@ def main_demo(tmpdirname, pe3r, device, server_name, server_port, silent=False):
         else:
             print('no input')
 
-        url_dict = listup(input_files)
-        gallery_data = []
+        url_dict, mask_list, ordered_ids = listup(input_files)
         
-        # 딕셔너리에 있는 URL을 순회하며 이미지 다운로드
+        gallery_data = []
         for folder_id, url in url_dict.items():
             try:
                 response = requests.get(url[0])
@@ -769,7 +865,18 @@ def main_demo(tmpdirname, pe3r, device, server_name, server_port, silent=False):
                 print(f"Error loading image from {url[0]}: {e}")
                 continue
                 
-        return gallery_data
+        return gallery_data, mask_list, ordered_ids
+    
+    def on_gallery_select(scene, mask_data, id_list, 
+                                      conf, pc, sky, clean, trans, size, 
+                                      evt: gr.SelectData): # evt를 명시적으로 선언
+                    
+                    return highlight_selected_object(
+                        scene, mask_data, id_list, 
+                        conf, pc, sky, clean, trans, size, 
+                        evt, 
+                        outdir=tmpdirname  # main_demo의 변수 tmpdirname 사용
+                    )
 
     # -------------------------------------------------------------------------
 
@@ -780,6 +887,8 @@ def main_demo(tmpdirname, pe3r, device, server_name, server_port, silent=False):
         original_scene = gr.State(None)       
         original_inputfiles = gr.State(None)
         original_report_text = gr.State(None) # 리포트 백업용
+        mask_data_state = gr.State([])
+        object_id_list_state = gr.State([])
 
         gr.Markdown("## 🧊 PE3R Demo")
 
@@ -806,7 +915,13 @@ def main_demo(tmpdirname, pe3r, device, server_name, server_port, silent=False):
 
                 run_btn = gr.Button("Reconstruct", variant="primary", elem_classes=["primary-btn"])
                 IR_btn = gr.Button("가구 모델명 찾기", variant="primary", elem_classes=["primary-btn"])
+                
                 revert_btn = gr.Button("↩️ 원본 되돌리기", variant="secondary")
+
+                with gradio.Row():
+                    text_input = gradio.Textbox(label="Query Text")
+                    threshold = gradio.Slider(label="Threshold", value=0.85, minimum=0.0, maximum=1.0, step=0.01)
+                find_btn = gradio.Button("Find")
                 
                 # [수정됨] 초기에는 보이지 않도록 visible=False 설정
                 # 변수명(analysis_accordion)을 할당해야 나중에 업데이트 가능
@@ -842,7 +957,27 @@ def main_demo(tmpdirname, pe3r, device, server_name, server_port, silent=False):
                 )
                 
                 # 버튼 클릭 시 함수 실행 -> 갤러리에 출력
-        IR_btn.click(fn=run_and_display, inputs=[inputfiles], outputs=result_gallery)
+        IR_btn.click(
+            fn=run_and_display, 
+            inputs=[inputfiles], 
+            outputs=[result_gallery, mask_data_state, object_id_list_state] # State에 저장
+        )
+
+        result_gallery.select(
+                    fn=on_gallery_select,
+                    inputs=[
+                        scene,                
+                        mask_data_state,      
+                        object_id_list_state, 
+                        min_conf_thr,         
+                        as_pointcloud,        
+                        mask_sky,             
+                        clean_depth,          
+                        transparent_cams,     
+                        cam_size              
+                    ],
+                    outputs=outmodel
+                )
 
         # ---------------------------------------------------------------------
         # [이벤트 흐름 1: 기본 Reconstruct 버튼 (원본 생성)]
@@ -988,5 +1123,9 @@ def main_demo(tmpdirname, pe3r, device, server_name, server_port, silent=False):
         mask_sky.change(fn=model_from_scene_fun, inputs=update_inputs, outputs=outmodel)
         clean_depth.change(fn=model_from_scene_fun, inputs=update_inputs, outputs=outmodel)
         transparent_cams.change(model_from_scene_fun, inputs=update_inputs, outputs=outmodel)
+        find_btn.click(fn=get_3D_object_from_scene_fun,
+                             inputs=[text_input, threshold, scene, min_conf_thr, as_pointcloud, mask_sky,
+                                      clean_depth, transparent_cams, cam_size],
+                            outputs=outmodel)
 
     demo.launch(share=True, server_name=server_name, server_port=server_port)
